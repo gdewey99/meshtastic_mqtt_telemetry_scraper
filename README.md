@@ -10,6 +10,7 @@ This script subscribes to the public Meshtastic MQTT broker, logs telemetry to C
 CSV/JSONL outputs always have clean values — colors/arrows are live view only.
 
 ---
+<img width="1136" height="446" alt="image" src="https://github.com/user-attachments/assets/a82105f5-f283-4254-a293-971705db5242" />
 
 ## Installation
 
