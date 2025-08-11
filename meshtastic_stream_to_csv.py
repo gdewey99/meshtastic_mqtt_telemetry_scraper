@@ -2,12 +2,18 @@
 """
 meshtastic_stream_to_csv.py
 
-Subscribe to Meshtastic public MQTT, optionally filter by node(s), and log to JSONL + CSV.
+Subscribe to Meshtastic public MQTT, optionally filter by node(s), and log to JSONL + CSV (+ optional RAW JSONL).
+- Live view with env colors and trend arrows (↑ green / ↓ red / → yellow) for env + RSSI/SNR.
+- Derived fields:
+    relative_humidity  (numeric %, logged)
+    barometric_pressure (numeric hPa, logged)
+    relative_humidity_pretty  (live-only pretty)
+    barometric_pressure_pretty (live-only pretty)
+- Daily rotation for all outputs.
+- Per-node split (--split-by-node), optional combined disable (--no-combined).
+- NEW: Raw JSON capture (--raw-jsonl) writing the exact broker payload lines (with same rotation & split flags, and --raw-no-combined).
 
-Highlights:
-- Live view (grid/kv/json) with env field colors, trend arrows, derived RH/pressure.
-- Daily file rotation.
-- NEW: --split-by-node to write separate CSV/JSONL per node (plus optional combined).
+Default live keys now show **ALL CSV fields plus pretty fields**.
 """
 
 import argparse
@@ -21,7 +27,7 @@ import time
 import shutil
 import textwrap
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 import paho.mqtt.client as mqtt
 
@@ -68,6 +74,9 @@ def c_to_f(c: Optional[float]) -> Optional[float]:
     except Exception:
         return None
 
+def hpa_to_inhg(hpa: float) -> float:
+    return hpa * 0.0295299830714
+
 def ensure_keys(d: Dict[str, Any], keys: List[str]) -> Dict[str, Any]:
     return {k: d.get(k, None) for k in keys}
 
@@ -75,7 +84,7 @@ def safe_part(s: str) -> str:
     # keep alnum, dash, underscore, exclamation; replace others with '_'
     return re.sub(r'[^0-9A-Za-z_\-!]+', '_', s)[:64]
 
-# ---------- CSV Fields ----------
+# ---------- CSV fields (include derived numeric) ----------
 CSV_FIELDS = [
     "epoch",
     "local_time_iso",
@@ -97,7 +106,9 @@ CSV_FIELDS = [
     "temperature_c",
     "temperature_f",
     "humidity",
+    "relative_humidity",     # numeric %
     "pressure_hpa",
+    "barometric_pressure",   # numeric hPa
     "gas_resistance_ohm",
     "iaq",
     "lux",
@@ -115,29 +126,10 @@ CSV_FIELDS = [
     "air_util_tx",
 ]
 
-# ---------- Live-only derived fields ----------
-DERIVED_KEYS = ["relative_humidity", "barometric_pressure"]
+# Live-only pretty field names
+DERIVED_KEYS_PRETTY = ["relative_humidity_pretty", "barometric_pressure_pretty"]
 
-def hpa_to_inhg(hpa: float) -> float:
-    return hpa * 0.0295299830714
-
-def add_live_derived(row: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(row)
-    if row.get("humidity") is not None:
-        try:
-            rh = float(row["humidity"])
-            out["relative_humidity"] = f"{rh:.0f} %"
-        except Exception:
-            pass
-    if row.get("pressure_hpa") is not None:
-        try:
-            p = float(row["pressure_hpa"])
-            out["barometric_pressure"] = f"{p:.1f} hPa ({hpa_to_inhg(p):.2f} inHg)"
-        except Exception:
-            pass
-    return out
-
-# ---------- Env/RF fields and colors ----------
+# ---------- Env/RF + colors ----------
 ENV_FIELDS = {
     "temperature_c","temperature_f","humidity","pressure_hpa","iaq","lux","white_lux",
     "wind_speed","wind_gust","wind_lull","wind_direction_deg","radiation_cpm",
@@ -146,7 +138,6 @@ ENV_FIELDS = {
 RF_FIELDS = {"rssi","snr"}
 
 GREEN = "\033[32m"; RED = "\033[31m"; YELL = "\033[33m"; RESET = "\033[0m"
-
 FIELD_COLOR = {
     "temperature_c":"\033[33m", "temperature_f":"\033[33m",
     "humidity":"\033[36m", "relative_humidity":"\033[36m",
@@ -156,11 +147,37 @@ FIELD_COLOR = {
     "wind_speed":"\033[32m","wind_gust":"\033[32m","wind_lull":"\033[32m","wind_direction_deg":"\033[32m",
     "radiation_cpm":"\033[31m",
 }
-
-DERIVED_TREND_SOURCE = {
-    "relative_humidity": "humidity",
-    "barometric_pressure": "pressure_hpa",
+DERIVED_TREND_SOURCE = {  # pretty field -> numeric source for delta
+    "relative_humidity_pretty": "relative_humidity",
+    "barometric_pressure_pretty": "pressure_hpa",
 }
+
+# ---------- Derived (numeric for logs; pretty for live) ----------
+def compute_derived_numeric(row: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(row)
+    rh = row.get("humidity")
+    if rh is not None:
+        try: out["relative_humidity"] = float(rh)
+        except Exception: out["relative_humidity"] = None
+    else:
+        out["relative_humidity"] = None
+    p = row.get("pressure_hpa")
+    try: out["barometric_pressure"] = float(p) if p is not None else None
+    except Exception: out["barometric_pressure"] = None
+    return out
+
+def compute_derived_pretty(row: Dict[str, Any]) -> Dict[str, Any]:
+    out = {}
+    if row.get("relative_humidity") is not None:
+        try: out["relative_humidity_pretty"] = f"{float(row['relative_humidity']):.0f} %"
+        except Exception: pass
+    if row.get("pressure_hpa") is not None:
+        try:
+            p = float(row["pressure_hpa"])
+            out["barometric_pressure_pretty"] = f"{p:.1f} hPa ({hpa_to_inhg(p):.2f} inHg)"
+        except Exception:
+            pass
+    return out
 
 # ---------- Flattening ----------
 def flatten_message(msg_json: Dict[str, Any], topic: str) -> Dict[str, Any]:
@@ -209,7 +226,7 @@ def flatten_message(msg_json: Dict[str, Any], topic: str) -> Dict[str, Any]:
 
     text = msg_json.get("text") or payload.get("text")
 
-    out = {
+    base = {
         "epoch": epoch,
         "local_time_iso": local_time_iso,
         "utc_time_iso": utc_time_iso,
@@ -247,7 +264,9 @@ def flatten_message(msg_json: Dict[str, Any], topic: str) -> Dict[str, Any]:
         "channel_utilization": channel_utilization,
         "air_util_tx": air_util_tx,
     }
-    return ensure_keys(out, CSV_FIELDS)
+    base = ensure_keys(base, CSV_FIELDS)
+    base = compute_derived_numeric(base)
+    return base
 
 # ---------- Live formatting ----------
 def detect_width(override: Optional[int]) -> int:
@@ -298,9 +317,9 @@ def layout_grid(kv_pairs, width: int, columns: Optional[int], colwidth: Optional
     return "\n".join(grid_lines)
 
 def format_live(row: Dict[str, Any], fmt: str, keys: Optional[List[str]], width: int, columns: Optional[int], colwidth: Optional[int], trunc: bool, color_mode: str, colors_for: Dict[str, Optional[str]]) -> str:
-    # Default: show ALL fields (CSV + derived)
+    # Default: ALL CSV fields plus pretty derived
     if keys is None:
-        keys = CSV_FIELDS + DERIVED_KEYS
+        keys = CSV_FIELDS + DERIVED_KEYS_PRETTY
     data = [(k, row.get(k)) for k in keys if k in row and row.get(k) is not None]
     kv_pairs = [(k, str(v)) for k, v in data]
 
@@ -308,7 +327,10 @@ def format_live(row: Dict[str, Any], fmt: str, keys: Optional[List[str]], width:
     if color_mode == "env":
         colors = []
         for k, _ in kv_pairs:
-            colors.append(colors_for.get(k))
+            color_key = k
+            if k == "relative_humidity_pretty": color_key = "relative_humidity"
+            if k == "barometric_pressure_pretty": color_key = "barometric_pressure"
+            colors.append(FIELD_COLOR.get(color_key))
 
     if fmt == "json":
         d = {k: v for k, v in data}
@@ -329,18 +351,16 @@ def format_live(row: Dict[str, Any], fmt: str, keys: Optional[List[str]], width:
             parts.append(s)
         return "  ".join(parts)
 
-    # grid
     return layout_grid(kv_pairs, width=width, columns=columns, colwidth=colwidth, trunc=trunc, colors=colors)
 
-# ---------- Rotators (daily & per-node) ----------
+# ---------- Rotators ----------
 class DailyRotator:
-    def __init__(self, csv_base: str, jsonl_base: str, suffix: Optional[str] = None):
-        self.csv_base = csv_base
-        self.jsonl_base = jsonl_base
-        self.suffix = suffix  # e.g., node id for per-node
+    def __init__(self, base: str, fieldnames: Optional[List[str]] = None, suffix: Optional[str] = None):
+        self.base = base
+        self.fieldnames = fieldnames  # None for raw lines
+        self.suffix = suffix
         self.cur_date = None
-        self.csv_fp = None
-        self.json_fp = None
+        self.fp = None
         self.writer = None
 
     def _with_date(self, base: str, day: str) -> str:
@@ -349,64 +369,63 @@ class DailyRotator:
             return f"{root}_{self.suffix}_{day}{ext or ''}"
         return f"{root}_{day}{ext or ''}"
 
-    def _open_files(self):
+    def _open(self):
         day = datetime.now().strftime("%Y-%m-%d")
-        if self.cur_date == day and self.csv_fp and self.json_fp:
+        if self.cur_date == day and self.fp:
             return
-
         self.close()
         self.cur_date = day
+        path = self._with_date(self.base, day)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        mode = "a"
+        newline = ""
+        enc = "utf-8"
+        self.fp = open(path, mode, newline=newline, encoding=enc)
+        if self.fieldnames:
+            self.writer = csv.DictWriter(self.fp, fieldnames=self.fieldnames)
+            if os.stat(path).st_size == 0:
+                self.writer.writeheader()
 
-        csv_path = self._with_date(self.csv_base, day)
-        json_path = self._with_date(self.jsonl_base, day)
-
-        os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-        os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
-
-        new_file = not os.path.exists(csv_path)
-        self.csv_fp = open(csv_path, "a", newline="", encoding="utf-8")
-        self.writer = csv.DictWriter(self.csv_fp, fieldnames=CSV_FIELDS)
-        if new_file:
-            self.writer.writeheader()
-
-        self.json_fp = open(json_path, "a", encoding="utf-8")
-
-    def write_csv(self, row: Dict[str, Any]):
-        self._open_files()
+    def write_csv_row(self, row: Dict[str, Any]):
+        self._open()
         self.writer.writerow(row)
-        self.csv_fp.flush()
+        self.fp.flush()
 
-    def write_jsonl(self, obj: Dict[str, Any]):
-        self._open_files()
-        self.json_fp.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        self.json_fp.flush()
+    def write_jsonl_obj(self, obj: Dict[str, Any]):
+        self._open()
+        self.fp.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        self.fp.flush()
+
+    def write_raw_line(self, raw_line: str):
+        self._open()
+        self.fp.write(raw_line + ("\n" if not raw_line.endswith("\n") else ""))
+        self.fp.flush()
 
     def close(self):
-        if self.csv_fp:
-            self.csv_fp.close()
-            self.csv_fp = None
-        if self.json_fp:
-            self.json_fp.close()
-            self.json_fp = None
+        if self.fp:
+            self.fp.close()
+            self.fp = None
+            self.writer = None
 
 class PerNodeRotator:
-    """
-    Manages a DailyRotator per node when --split-by-node is enabled.
-    Node key is chosen from 'sender' (preferred) or normalized 'from'.
-    """
-    def __init__(self, csv_base: str, jsonl_base: str):
-        self.csv_base = csv_base
-        self.jsonl_base = jsonl_base
+    def __init__(self, base: str, fieldnames: Optional[List[str]] = None, include_type: bool = False):
+        self.base = base
+        self.fieldnames = fieldnames
+        self.include_type = include_type
         self.map: Dict[str, DailyRotator] = {}
 
-    def _key_from_row(self, row: Dict[str, Any]) -> str:
+    def _suffix_from_row(self, row: Dict[str, Any]) -> str:
         node = row.get("sender") or normalize_node_id(row.get("from")) or "unknown"
-        return safe_part(node)
+        node = safe_part(node)
+        if self.include_type:
+            t = safe_part(str(row.get("type") or "unknown"))
+            return f"{node}_{t}"
+        return node
 
     def get(self, row: Dict[str, Any]) -> DailyRotator:
-        key = self._key_from_row(row)
+        key = self._suffix_from_row(row)
         if key not in self.map:
-            self.map[key] = DailyRotator(self.csv_base, self.jsonl_base, suffix=key)
+            self.map[key] = DailyRotator(self.base, fieldnames=self.fieldnames, suffix=key)
         return self.map[key]
 
     def close(self):
@@ -417,6 +436,14 @@ class PerNodeRotator:
 class MeshtasticLogger:
     def __init__(self, args):
         self.args = args
+                # Make sure targets exists before callbacks can ever fire
+        self.targets = set(normalize_node_id(x) for x in (getattr(args, "nodes", []) or []))
+        # If you also have split_for, normalize once here (safe even if not used)
+        self.split_for = (
+            set(normalize_node_id(x) for x in (getattr(args, "split_for", []) or []))
+            or None
+        )
+
         self.client = mqtt.Client(client_id=args.client_id or f"meshtastic-logger-{int(time.time())}", clean_session=True)
         if args.user:
             self.client.username_pw_set(args.user, args.password or None)
@@ -425,14 +452,27 @@ class MeshtasticLogger:
         self.client.on_message = self.on_message
         self.client.on_disconnect = self.on_disconnect
 
-        self.targets = set(normalize_node_id(x) for x in (args.nodes or []))
-        # combined rotator (used if not splitting, or if keeping combined too)
-        self.combined_rotator = DailyRotator(csv_base=args.csv, jsonl_base=args.jsonl)
-        # per-node rotators (used when splitting)
-        self.pernode = PerNodeRotator(csv_base=args.csv, jsonl_base=args.jsonl) if args.split_by_node else None
+        
+        # Nodes we want extra per-node files for (does NOT filter stream)
+        #self.split_for = (set(normalize_node_id(x) for x in (getattr(args, "split_for", []) or [])) or None)
+        self.split_for = (
+            set(normalize_node_id(x) for x in (getattr(args, "split_for", []) or []))
+            or None
+        )
+
+        # Rotators: combined
+        self.csv_rot = DailyRotator(args.csv, fieldnames=CSV_FIELDS)
+        self.json_rot = DailyRotator(args.jsonl, fieldnames=None)  # jsonl uses raw write_jsonl_obj
+        # Per-node rotators
+        self.csv_pernode = PerNodeRotator(args.csv, fieldnames=CSV_FIELDS) if args.split_by_node or args.split_for else None
+        self.json_pernode = PerNodeRotator(args.jsonl, fieldnames=None) if args.split_by_node or args.split_for else None
+
+        # RAW rotators (if enabled)
+        self.raw_rot = DailyRotator(args.raw_jsonl, fieldnames=None) if args.raw_jsonl else None
+        self.raw_pernode = PerNodeRotator(args.raw_jsonl, fieldnames=None) if (args.raw_jsonl and (args.split_by_node or args.split_for)) else None
 
         self.stopping = False
-        self.last_values: Dict[str, Dict[str, float]] = {}  # trends per sender
+        self.last_values: Dict[str, Dict[str, float]] = {}
 
     def start(self):
         self._connect()
@@ -452,10 +492,13 @@ class MeshtasticLogger:
             self.client.disconnect()
         except Exception:
             pass
-        # Close all files
-        if self.pernode:
-            self.pernode.close()
-        self.combined_rotator.close()
+        # Close all rotators
+        if self.csv_pernode: self.csv_pernode.close()
+        if self.json_pernode: self.json_pernode.close()
+        if self.raw_pernode: self.raw_pernode.close()
+        self.csv_rot.close()
+        self.json_rot.close()
+        if self.raw_rot: self.raw_rot.close()
 
     def _connect(self):
         while not self.stopping:
@@ -469,9 +512,8 @@ class MeshtasticLogger:
     def on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             print(f"[INFO] Connected to {self.args.host}:{self.args.port}")
-            topic = self.args.topic
-            client.subscribe(topic, qos=0)
-            print(f"[INFO] Subscribed: {topic}")
+            client.subscribe(self.args.topic, qos=0)
+            print(f"[INFO] Subscribed: {self.args.topic}")
         else:
             print(f"[ERROR] Connect failed with code {rc}", file=sys.stderr)
 
@@ -480,10 +522,8 @@ class MeshtasticLogger:
             print("[WARN] Unexpected disconnect. Reconnecting...", file=sys.stderr)
 
     def _arrow_for_delta(self, delta: float, eps: float) -> str:
-        if delta > eps:
-            return f" {GREEN}↑{RESET}"
-        if delta < -eps:
-            return f" {RED}↓{RESET}"
+        if delta > eps:   return f" {GREEN}↑{RESET}"
+        if delta < -eps:  return f" {RED}↓{RESET}"
         return f" {YELL}→{RESET}"
 
     def _decorate_trend(self, row: Dict[str, Any], eps: float) -> Dict[str, Any]:
@@ -492,8 +532,7 @@ class MeshtasticLogger:
 
         decorated = dict(row)
 
-        # Base env + RF fields (not derived)
-        trend_fields = (ENV_FIELDS | RF_FIELDS) - set(DERIVED_KEYS)
+        trend_fields = (ENV_FIELDS | RF_FIELDS) - {"relative_humidity_pretty","barometric_pressure_pretty"}
         for k in trend_fields:
             v = row.get(k)
             if v is None:
@@ -509,12 +548,14 @@ class MeshtasticLogger:
             decorated[k] = f"{v}{arrow}"
             prev_map[k] = cur
 
-        # Derived fields arrows from source
         for dk, src in DERIVED_TREND_SOURCE.items():
-            if row.get(src) is None or dk not in row:
+            if dk not in row:
+                continue
+            src_val = row.get(src)
+            if src_val is None:
                 continue
             try:
-                cur = float(row[src])
+                cur = float(src_val)
             except Exception:
                 continue
             prev = prev_map.get(src)
@@ -526,36 +567,60 @@ class MeshtasticLogger:
 
         return decorated
 
-    def _write_logs(self, row: Dict[str, Any], obj: Dict[str, Any]):
-        """Write to per-node and/or combined outputs depending on flags."""
+    def _write_logs(self, row: Dict[str, Any], enriched: Dict[str, Any], raw_line: Optional[str]):
         wrote_any = False
 
+        # Per-node (CSV/JSON/RAW)
+        # Per-node writes: if --split-by-node (all nodes) OR --split-for (selected nodes)
+        want_pernode = False
         if self.args.split_by_node:
-            rot = self.pernode.get(row)
-            rot.write_jsonl(obj)
-            rot.write_csv(row)
+            want_pernode = True
+        elif self.split_for:
+            node_hex = normalize_node_id(row.get("sender") or row.get("from"))
+            if node_hex in self.split_for:
+                want_pernode = True
+
+        if want_pernode:
+            if self.csv_pernode:
+                self.csv_pernode.get(row).write_csv_row(row)
+            if self.json_pernode:
+                self.json_pernode.get(row).write_jsonl_obj(enriched)
+            if self.raw_pernode and raw_line is not None:
+                self.raw_pernode.get(row).write_raw_line(raw_line)
             wrote_any = True
 
-        if (not self.args.split_by_node) or self.args.keep_combined:
-            self.combined_rotator.write_jsonl(obj)
-            self.combined_rotator.write_csv(row)
+        # Combined (CSV/JSON/RAW) unless disabled with flags
+        if (not self.args.split_by_node) or (self.args.split_by_node and not self.args.no_combined):
+            self.csv_rot.write_csv_row(row)
+            self.json_rot.write_jsonl_obj(enriched)
+            if self.raw_rot and raw_line is not None and not self.args.raw_no_combined:
+                self.raw_rot.write_raw_line(raw_line)
             wrote_any = True
 
         if not wrote_any:
-            # Fallback, shouldn't happen
-            self.combined_rotator.write_jsonl(obj)
-            self.combined_rotator.write_csv(row)
+            self.csv_rot.write_csv_row(row)
+            self.json_rot.write_jsonl_obj(enriched)
+            if self.raw_rot and raw_line is not None and not self.args.raw_no_combined:
+                self.raw_rot.write_raw_line(raw_line)
 
     def on_message(self, client, userdata, msg):
         try:
-            payload_str = msg.payload.decode("utf-8", errors="replace").strip()
-            if not payload_str:
-                return
-            try:
-                obj = json.loads(payload_str)
-            except json.JSONDecodeError:
+            # Exact raw payload text (decoded to utf-8 with replacement, but no JSON reformat)
+            raw_line = msg.payload.decode("utf-8", errors="replace").strip()
+            if not raw_line:
                 return
 
+            try:
+                obj = json.loads(raw_line)
+            except json.JSONDecodeError:
+                # If it isn't JSON, still store raw (if requested), but skip structured logging
+                if self.raw_rot or self.raw_pernode:
+                    # minimal synthetic row for routing fallback
+                    dummy = {"sender": None, "from": None}
+                    self._write_logs({}, {}, raw_line)
+                return
+
+            # Filter by --nodes if provided (accepts !hex or decimal)
             if self.targets:
                 sender = (obj.get("sender") or "").lower().strip()
                 frm = obj.get("from")
@@ -563,25 +628,36 @@ class MeshtasticLogger:
                 if sender not in self.targets and frm_hex not in self.targets:
                     return
 
-            # Persist clean data
             row = flatten_message(obj, topic=msg.topic)
-            self._write_logs(row, obj)
+
+            # Enrich JSONL with flattened & pretty
+            enriched = dict(obj)
+            enriched["_flat"] = ensure_keys(row, CSV_FIELDS)
+            pretty = compute_derived_pretty(row)
+            if pretty:
+                enriched["_derived_pretty"] = pretty
+
+            # Write logs (CSV/JSONL/RAW per flags)
+            self._write_logs(row, enriched, raw_line if self.args.raw_jsonl else None)
 
             # Live display
             if self.args.live:
                 try:
                     width = detect_width(self.args.live_width)
-                    live_row = add_live_derived(row)
+                    live_row = dict(row)
+                    live_row.update(pretty)
                     if self.args.live_trend:
                         live_row = self._decorate_trend(live_row, eps=self.args.live_trend_epsilon)
 
-                    colors_for = {k: None for k in (CSV_FIELDS + DERIVED_KEYS)}
+                    colors_for = {k: None for k in (CSV_FIELDS + DERIVED_KEYS_PRETTY)}
                     if self.args.live_color == "env":
                         for k in ENV_FIELDS:
                             if k in colors_for:
                                 colors_for[k] = FIELD_COLOR.get(k)
+                        colors_for["relative_humidity_pretty"] = FIELD_COLOR.get("relative_humidity")
+                        colors_for["barometric_pressure_pretty"] = FIELD_COLOR.get("barometric_pressure")
 
-                    keys = self.args.live_keys if self.args.live_keys is not None else (CSV_FIELDS + DERIVED_KEYS)
+                    keys = self.args.live_keys if self.args.live_keys is not None else (CSV_FIELDS + DERIVED_KEYS_PRETTY)
 
                     line = format_live(
                         live_row,
@@ -605,31 +681,44 @@ class MeshtasticLogger:
 
 # ---------- main ----------
 def main():
-    parser = argparse.ArgumentParser(description="Stream Meshtastic MQTT to JSONL + CSV with optional node filtering.")
+    parser = argparse.ArgumentParser(description="Stream Meshtastic MQTT to JSONL + CSV (+ optional raw) with optional node filtering.")
+
+    # MQTT
     parser.add_argument("--host", default="mqtt.meshtastic.org", help="MQTT host")
     parser.add_argument("--port", type=int, default=1883, help="MQTT port")
     parser.add_argument("--user", default="meshdev", help="MQTT username (public broker uses 'meshdev')")
     parser.add_argument("--password", default="large4cats", help="MQTT password for user (public broker default)")
     parser.add_argument("--topic", default="msh/US/#", help="MQTT topic filter (e.g., msh/US/#)")
     parser.add_argument("--client-id", default=None, help="MQTT client ID")
+
+    # Filter
     parser.add_argument("--nodes", nargs="*", help="Filter to these node IDs (accepts '!xxxxxxxx' or decimal like 3825485809)")
+
+    # Files (CSV/JSONL)
     parser.add_argument("--csv", default="meshtastic_stream.csv", help="CSV base filename (daily rotated)")
     parser.add_argument("--jsonl", default="meshtastic_stream.jsonl", help="JSONL base filename (daily rotated)")
-    # Live options
+
+    # Raw JSON capture
+    parser.add_argument("--raw-jsonl", default=None, help="RAW JSONL base filename (daily rotated). Writes exact broker payload lines.")
+    parser.add_argument("--raw-no-combined", action="store_true", help="When splitting, do NOT write combined RAW file")
+
+    # Live
     parser.add_argument("--live", action="store_true", help="Print a live summary for each packet")
     parser.add_argument("--live-format", choices=["grid","kv","json"], default="grid", help="Live summary format")
     parser.add_argument("--live-keys", type=lambda s: [x.strip() for x in s.split(",")] if s else None,
-                        help="Fields to show in live mode (default: ALL fields incl. derived)")
+                        help="Comma-separated list of fields to show in live (default: ALL CSV fields + pretty RH/baro)")
     parser.add_argument("--live-width", type=int, default=None, help="Override detected terminal width")
     parser.add_argument("--live-columns", type=int, default=None, help="Force number of columns in grid format")
     parser.add_argument("--live-colwidth", type=int, default=None, help="Max width of each grid cell")
     parser.add_argument("--live-trunc", action="store_true", help="Truncate values in grid cells instead of wrapping")
-    parser.add_argument("--live-color", choices=["off","env"], default="env", help="Colorize env fields in live output")
-    parser.add_argument("--live-trend", action="store_true", help="Show trend arrows (↑/↓/→) on env + RF fields")
+    parser.add_argument("--live-color", choices=["off","env"], default="env", help="Colorize env values in live output")
+    parser.add_argument("--live-trend", action="store_true", help="Show trend arrows (↑/↓/→) on env + RF fields (arrow colored only)")
     parser.add_argument("--live-trend-epsilon", type=float, default=0.01, help="Ignore small changes below this delta")
-    # NEW logging split options
+
+    # Split options
     parser.add_argument("--split-by-node", action="store_true", help="Write separate CSV/JSONL per node")
-    parser.add_argument("--keep-combined", action="store_true", help="When splitting, also write the combined files")
+    parser.add_argument("--no-combined", action="store_true", help="When splitting, do NOT write the combined CSV/JSONL files")
+    parser.add_argument("--split-for", nargs="*",default=None, help="Only create per-node files for these node IDs; others go to combined only (requires --split-by-node).")
     args = parser.parse_args()
 
     logger = MeshtasticLogger(args)
