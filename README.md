@@ -28,21 +28,10 @@ Edit
 sudo apt update
 sudo apt install -y python3 python3-pip
 pip3 install --break-system-packages -r requirements.txt
-Method B — Virtual environment (recommended):
 
-bash
-Copy
-Edit
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
 
 Usage
 Common flags:
-
-lua
-Copy
-Edit
 --live                  Live terminal view
 --live-color env        Color environment values by type
 --live-trend            Add colored trend arrows for env + RSSI/SNR
@@ -50,16 +39,8 @@ Edit
 --split-by-node         Write separate CSV/JSONL per node
 --keep-combined         Keep combined file along with per-node files
 Example:
-
-bash
-Copy
-Edit
 ./meshtastic_stream_to_csv.py --live --live-color env --live-trend
 Split per node and keep combined:
-
-bash
-Copy
-Edit
 ./meshtastic_stream_to_csv.py --nodes !a2eb420c !db77dcd8 \
   --live --live-trend --split-by-node --keep-combined
 Dependencies
@@ -74,26 +55,7 @@ Copy
 Edit
 sudo apt install python3 python3-pip
 pip3 install --break-system-packages paho-mqtt
-MQTT Defaults
-Host: mqtt.meshtastic.org
 
-Port: 1883
 
-User: meshdev
-
-Password: large4cats
-
-Topic: msh/US/#
-
-Raspberry Pi Tips
-Using a virtual environment avoids conflicts with system packages:
-
-bash
-Copy
-Edit
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-To run at boot, create a systemd service file pointing to your script.
 
 
