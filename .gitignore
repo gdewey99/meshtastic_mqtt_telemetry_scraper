@@ -1,3 +1,4 @@
 *.csv
 *.jsonl
 __pycache__/
+*.html
