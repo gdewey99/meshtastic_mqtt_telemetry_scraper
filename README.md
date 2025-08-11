@@ -23,7 +23,7 @@ Install dependencies (choose one):
 Method A — System Python (Debian/Ubuntu/Raspberry Pi OS):
 
 sudo apt install -y python3 python3-pip
-
+pip3 install folium #for map script
 Usage
 Common flags:
 --live                  Live terminal view
