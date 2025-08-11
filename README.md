@@ -22,13 +22,7 @@ Install dependencies (choose one):
 
 Method A — System Python (Debian/Ubuntu/Raspberry Pi OS):
 
-bash
-Copy
-Edit
-sudo apt update
 sudo apt install -y python3 python3-pip
-pip3 install --break-system-packages -r requirements.txt
-
 
 Usage
 Common flags:
@@ -43,6 +37,12 @@ Example:
 Split per node and keep combined:
 ./meshtastic_stream_to_csv.py --nodes !a2eb420c !db77dcd8 \
   --live --live-trend --split-by-node --keep-combined
+
+
+Balloon example:
+./meshtastic_stream_to_csv.py --nodes 3825485809 '!db77dcd8' --split-by-node --live --live-trend
+
+
 Dependencies
 Python 3.9+
 
@@ -50,11 +50,8 @@ paho-mqtt Python package
 
 On Debian-based systems:
 
-bash
-Copy
-Edit
 sudo apt install python3 python3-pip
-pip3 install --break-system-packages paho-mqtt
+pip3 install paho-mqtt
 
 
 
